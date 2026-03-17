@@ -1,0 +1,697 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>AI Connection Monitor</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+        background: #0f172a;
+        color: #e5e7eb;
+      }
+      .app {
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+        padding: 12px 16px;
+        box-sizing: border-box;
+        gap: 12px;
+      }
+      .header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      .title {
+        font-size: 16px;
+        font-weight: 600;
+      }
+      .stats {
+        font-size: 12px;
+        color: #9ca3af;
+      }
+      .controls {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+      select,
+      input {
+        background: #020617;
+        border: 1px solid #1f2937;
+        border-radius: 4px;
+        color: #e5e7eb;
+        padding: 2px 6px;
+        font-size: 12px;
+      }
+      button {
+        background: #22c55e;
+        border: none;
+        border-radius: 4px;
+        color: #022c22;
+        padding: 4px 10px;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      .content {
+        display: grid;
+        grid-template-columns: 1.1fr 2fr;
+        gap: 12px;
+        min-height: 0;
+      }
+      .panel {
+        background: #020617;
+        border-radius: 8px;
+        border: 1px solid #1f2937;
+        padding: 10px;
+        box-sizing: border-box;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+      }
+      .panel-title {
+        font-size: 13px;
+        font-weight: 500;
+        margin-bottom: 6px;
+      }
+      .chart-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 6px;
+      }
+      .chart-header .panel-title {
+        margin-bottom: 0;
+      }
+      .chart-zoom {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+      }
+      .chart-zoom button {
+        width: 24px;
+        height: 24px;
+        padding: 0;
+        font-size: 16px;
+        line-height: 1;
+        background: #1e293b;
+        border: 1px solid #334155;
+        color: #e5e7eb;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      .chart-zoom button:hover {
+        background: #334155;
+      }
+      .chart-zoom span {
+        font-size: 12px;
+        color: #9ca3af;
+        min-width: 28px;
+        text-align: center;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+      }
+      th,
+      td {
+        padding: 4px 6px;
+        text-align: left;
+        border-bottom: 1px solid #111827;
+      }
+      th {
+        color: #9ca3af;
+        font-weight: 500;
+      }
+      tr:last-child td {
+        border-bottom: none;
+      }
+      .status-ok {
+        color: #22c55e;
+      }
+      .status-fail {
+        color: #f97373;
+      }
+      .status-probing {
+        color: #f59e0b;
+      }
+      .chart-wrap {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        position: relative;
+      }
+      canvas {
+        flex: 1;
+        min-height: 120px;
+        border-radius: 6px;
+        background: #020617;
+        cursor: crosshair;
+      }
+      .chart-tooltip {
+        position: absolute;
+        background: #1e293b;
+        border: 1px solid #334155;
+        border-radius: 4px;
+        padding: 6px 10px;
+        font-size: 11px;
+        color: #e5e7eb;
+        pointer-events: none;
+        z-index: 10;
+        display: none;
+      }
+      .chart-tooltip.visible {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <div class="header">
+        <div>
+          <div class="title">AI Connection Monitor</div>
+          <div class="stats" id="summary"></div>
+        </div>
+        <div class="controls">
+          <label style="font-size: 12px">
+            间隔(ms)：
+            <input id="interval-input" type="number" min="5000" step="1000" />
+          </label>
+        </div>
+      </div>
+      <div class="content">
+        <div class="panel">
+          <div class="panel-title">当前状态</div>
+          <table>
+            <thead>
+              <tr>
+                <th>服务</th>
+                <th>状态</th>
+                <th>延迟(ms)</th>
+                <th>HTTP</th>
+                <th>错误</th>
+              </tr>
+            </thead>
+            <tbody id="status-body"></tbody>
+          </table>
+        </div>
+        <div class="panel">
+          <div class="chart-header">
+            <span class="panel-title">最近 24 小时延迟（全部服务）</span>
+            <div class="chart-zoom">
+              <button type="button" id="zoom-out" title="缩小">−</button>
+              <span id="zoom-label">1×</span>
+              <button type="button" id="zoom-in" title="放大">+</button>
+            </div>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="latency-canvas"></canvas>
+            <div id="chart-tooltip" class="chart-tooltip"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script>
+      (function () {
+        var invoke =
+          window.__TAURI__ &&
+          window.__TAURI__.core &&
+          typeof window.__TAURI__.core.invoke === "function"
+            ? window.__TAURI__.core.invoke
+            : null;
+        if (!invoke) {
+          invoke = function () {
+            return Promise.reject(new Error("Tauri invoke 不可用，请确认在 Tauri 窗口中打开"));
+          };
+        }
+        const statusBody = document.getElementById("status-body");
+      const summary = document.getElementById("summary");
+      const intervalInput = document.getElementById("interval-input");
+      const canvas = document.getElementById("latency-canvas");
+      const chartTooltip = document.getElementById("chart-tooltip");
+      const zoomInBtn = document.getElementById("zoom-in");
+      const zoomOutBtn = document.getElementById("zoom-out");
+      const zoomLabel = document.getElementById("zoom-label");
+      const ctx = canvas.getContext("2d");
+
+      let services = [];
+      const latestByService = new Map();
+      let isProbing = false;
+      let chartData = null;
+      /** 图表缩放级别：1=24h, 2=12h, 4=6h, 0.5=48h */
+      let chartZoomLevel = 1;
+
+      const CHART_COLORS = ["#22c55e", "#3b82f6", "#f59e0b", "#a855f7", "#ef4444"];
+
+      function getLogicalSize() {
+        const rect = canvas.getBoundingClientRect();
+        return { w: rect.width, h: rect.height };
+      }
+
+      function resizeCanvas() {
+        const rect = canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = rect.width * dpr;
+        canvas.height = rect.height * dpr;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+
+      window.addEventListener("resize", () => {
+        resizeCanvas();
+        drawLatencyAll();
+      });
+
+      function renderStatusTable() {
+        statusBody.innerHTML = "";
+        for (const svc of services) {
+          const tr = document.createElement("tr");
+          const latest = latestByService.get(svc.id);
+          const tdName = document.createElement("td");
+          tdName.textContent = svc.name;
+          const tdStatus = document.createElement("td");
+          const tdLatency = document.createElement("td");
+          const tdHttp = document.createElement("td");
+          const tdError = document.createElement("td");
+
+          if (isProbing) {
+            tdStatus.textContent = "检测中...";
+            tdStatus.className = "status-probing";
+            tdLatency.textContent = "-";
+            tdHttp.textContent = "-";
+            tdError.textContent = "-";
+          } else if (!latest) {
+            tdStatus.textContent = "-";
+            tdLatency.textContent = "-";
+            tdHttp.textContent = "-";
+            tdError.textContent = "-";
+          } else {
+            if (latest.reachable) {
+              tdStatus.textContent = "可达";
+              tdStatus.className = "status-ok";
+            } else {
+              tdStatus.textContent = "失败";
+              tdStatus.className = "status-fail";
+            }
+            tdLatency.textContent =
+              latest.latency_ms != null ? String(latest.latency_ms) : "-";
+            tdHttp.textContent =
+              latest.status_code != null ? String(latest.status_code) : "-";
+            tdError.textContent = latest.error_type ?? "-";
+          }
+
+          tr.appendChild(tdName);
+          tr.appendChild(tdStatus);
+          tr.appendChild(tdLatency);
+          tr.appendChild(tdHttp);
+          tr.appendChild(tdError);
+          statusBody.appendChild(tr);
+        }
+      }
+
+      function formatTimeLabel(ts) {
+        const d = new Date(ts);
+        const now = new Date();
+        const isToday = d.toDateString() === now.toDateString();
+        if (isToday) {
+          return d.getHours().toString().padStart(2, "0") + ":" + d.getMinutes().toString().padStart(2, "0");
+        }
+        return (d.getMonth() + 1) + "/" + d.getDate() + " " + d.getHours().toString().padStart(2, "0");
+      }
+
+      /**
+       * 根据当前缩放级别重新绘制延迟图表。
+       * 缩放影响时间范围：1×=24h, 2×=12h, 4×=6h, 0.5×=48h
+       */
+      async function drawLatencyAll() {
+        const now = Date.now();
+        const windowMs = (24 * 60 * 60 * 1000) / chartZoomLevel;
+        const since = now - windowMs;
+        let allPoints = [];
+        try {
+          const raw = await invoke("get_recent_probes_all", { sinceMs: since });
+          allPoints = Array.isArray(raw) ? raw : [];
+        } catch (e) {
+          console.error("get_recent_probes_all failed:", e);
+        }
+
+        const { w: logicalW, h: logicalH } = getLogicalSize();
+        ctx.clearRect(0, 0, logicalW, logicalH);
+        chartData = null;
+
+        const byService = new Map();
+        for (const p of allPoints) {
+          if (!byService.has(p.service_id)) {
+            byService.set(p.service_id, []);
+          }
+          byService.get(p.service_id).push(p);
+        }
+
+        let minX = Infinity, maxX = -Infinity, minY = 0, maxY = 100;
+        for (const pts of byService.values()) {
+          const xs = pts.map((p) => p.timestamp);
+          const ys = pts
+            .map((p) => (p.reachable && p.latency_ms != null ? p.latency_ms : null))
+            .filter((v) => v != null);
+          if (xs.length) {
+            minX = Math.min(minX, ...xs);
+            maxX = Math.max(maxX, ...xs);
+          }
+          if (ys.length) {
+            maxY = Math.max(maxY, ...ys);
+          }
+        }
+        if (minX === Infinity) minX = 0;
+        if (maxX === -Infinity) maxX = minX + 1;
+
+        const padLeft = 48;
+        const padRight = 12;
+        const padTop = 12;
+        const padBottom = 24;
+        const w = logicalW - padLeft - padRight;
+        const h = logicalH - padTop - padBottom;
+
+        function sx(t) {
+          if (maxX === minX) return padLeft;
+          return padLeft + ((t - minX) / (maxX - minX)) * w;
+        }
+        function sy(v) {
+          if (maxY === minY) return padTop + h;
+          return padTop + h - ((v - minY) / (maxY - minY)) * h;
+        }
+
+        ctx.fillStyle = "#9ca3af";
+        ctx.font = "11px system-ui";
+        ctx.textAlign = "right";
+        ctx.textBaseline = "middle";
+
+        const yStep = maxY <= 500 ? 100 : maxY <= 2000 ? 500 : 1000;
+        const yTicks = [];
+        for (let v = 0; v <= maxY + 1; v += yStep) yTicks.push(v);
+        if (yTicks.length > 0 && yTicks[yTicks.length - 1] < maxY) {
+          yTicks.push(Math.ceil(maxY / 100) * 100);
+        }
+        for (const v of yTicks) {
+          const y = sy(v);
+          ctx.beginPath();
+          ctx.moveTo(padLeft, y);
+          ctx.lineTo(padLeft + w, y);
+          ctx.strokeStyle = "#1f2937";
+          ctx.stroke();
+          ctx.fillText(v + "ms", padLeft - 4, y);
+        }
+
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        const xTickCount = 5;
+        for (let i = 0; i <= xTickCount; i++) {
+          const t = minX + (i / xTickCount) * (maxX - minX);
+          const x = sx(t);
+          ctx.beginPath();
+          ctx.moveTo(x, padTop);
+          ctx.lineTo(x, padTop + h);
+          ctx.strokeStyle = "#1f2937";
+          ctx.stroke();
+          ctx.fillText(formatTimeLabel(t), x, padTop + h + 4);
+        }
+
+        ctx.beginPath();
+        ctx.moveTo(padLeft, padTop);
+        ctx.lineTo(padLeft, padTop + h);
+        ctx.lineTo(padLeft + w, padTop + h);
+        ctx.strokeStyle = "#374151";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+
+        const legendItems = [];
+        services.forEach((svc, idx) => {
+          const pts = byService.get(svc.id) || [];
+          const color = CHART_COLORS[idx % CHART_COLORS.length];
+          legendItems.push({ name: svc.name, color });
+
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 1.5;
+          let segmentStarted = false;
+          for (const p of pts) {
+            const isValid = p.reachable && p.latency_ms != null;
+            if (isValid) {
+              const x = sx(p.timestamp);
+              const y = sy(p.latency_ms);
+              if (!segmentStarted) {
+                ctx.beginPath();
+                ctx.moveTo(x, y);
+                segmentStarted = true;
+              } else {
+                ctx.lineTo(x, y);
+              }
+            } else {
+              if (segmentStarted) {
+                ctx.stroke();
+                segmentStarted = false;
+              }
+            }
+          }
+          if (segmentStarted) ctx.stroke();
+        });
+
+        ctx.save();
+        ctx.textAlign = "left";
+        ctx.textBaseline = "middle";
+        ctx.font = "11px system-ui";
+        const legendX = padLeft + w - 120;
+        let legendY = padTop + 8;
+        for (const it of legendItems) {
+          ctx.fillStyle = it.color;
+          ctx.fillRect(legendX, legendY - 4, 18, 4);
+          ctx.fillStyle = "#e5e7eb";
+          ctx.fillText(it.name, legendX + 22, legendY - 2);
+          legendY += 14;
+        }
+        ctx.restore();
+
+        if (legendItems.length === 0) {
+          ctx.fillStyle = "#4b5563";
+          ctx.font = "12px system-ui";
+          ctx.fillText("暂无数据", 16, 24);
+          return;
+        }
+        chartData = { byService, legendItems, padLeft, padRight, padTop, padBottom, w, h, minX, maxX, minY, maxY };
+      }
+
+      let currentIntervalMs = 30000;
+
+      function updateSummary() {
+        let ok = 0;
+        let total = 0;
+        for (const svc of services) {
+          const latest = latestByService.get(svc.id);
+          if (!latest) continue;
+          total++;
+          if (latest.reachable) ok++;
+        }
+        const sec = Math.round(currentIntervalMs / 1000);
+        if (!total) {
+          summary.textContent = "暂无探测结果 · 每 " + sec + " 秒自动探测";
+        } else {
+          summary.textContent = "可达服务：" + ok + "/" + total + " · 每 " + sec + " 秒自动探测";
+        }
+      }
+
+      function updateIntervalHint(intervalMs) {
+        currentIntervalMs = intervalMs;
+        updateSummary();
+      }
+
+      /**
+       * 更新图表缩放级别并重绘。
+       * @param {number} delta - 缩放步进，正数放大、负数缩小
+       */
+      function applyChartZoom(delta) {
+        const levels = [0.5, 1, 2, 4, 8, 16];
+        const idx = levels.indexOf(chartZoomLevel);
+        const newIdx = Math.max(0, Math.min(levels.length - 1, idx + delta));
+        chartZoomLevel = levels[newIdx];
+        zoomLabel.textContent = chartZoomLevel + "×";
+        drawLatencyAll();
+      }
+
+      function setupChartZoom() {
+        zoomInBtn.addEventListener("click", () => applyChartZoom(1));
+        zoomOutBtn.addEventListener("click", () => applyChartZoom(-1));
+        const chartWrap = canvas.parentElement;
+        chartWrap.addEventListener("wheel", (e) => {
+          if (e.ctrlKey || e.metaKey) {
+            e.preventDefault();
+            applyChartZoom(e.deltaY > 0 ? -1 : 1);
+          }
+        }, { passive: false });
+      }
+
+      function setupChartHover() {
+        const chartWrap = canvas.parentElement;
+        canvas.addEventListener("mousemove", (e) => {
+          if (!chartData) return;
+          const wrapRect = chartWrap.getBoundingClientRect();
+          const mx = e.clientX - wrapRect.left;
+          const my = e.clientY - wrapRect.top;
+          const { byService, padLeft, padTop, w, h, minX, maxX, minY, maxY } = chartData;
+          if (mx < padLeft || mx > padLeft + w || my < padTop || my > padTop + h) {
+            chartTooltip.classList.remove("visible");
+            return;
+          }
+          const invX = minX + ((mx - padLeft) / w) * (maxX - minX);
+          let lines = [];
+          services.forEach((svc, idx) => {
+            const pts = (byService.get(svc.id) || []).filter((p) => p.reachable && p.latency_ms != null);
+            if (!pts.length) return;
+            let nearest = null;
+            let minDist = Infinity;
+            for (const p of pts) {
+              const dist = Math.abs(p.timestamp - invX);
+              if (dist < minDist) {
+                minDist = dist;
+                nearest = p;
+              }
+            }
+            if (nearest && minDist < (maxX - minX) / 20) {
+              const color = CHART_COLORS[idx % CHART_COLORS.length];
+              lines.push('<span style="color:' + color + '">' + svc.name + '</span>: ' + nearest.latency_ms + 'ms');
+            }
+          });
+          if (lines.length) {
+            chartTooltip.innerHTML = formatTimeLabel(invX) + "<br>" + lines.join("<br>");
+            chartTooltip.classList.add("visible");
+            const tx = Math.min(mx + 12, wrapRect.width - 120);
+            const ty = Math.min(my + 12, wrapRect.height - 80);
+            chartTooltip.style.left = tx + "px";
+            chartTooltip.style.top = ty + "px";
+          } else {
+            chartTooltip.classList.remove("visible");
+          }
+        });
+        canvas.addEventListener("mouseleave", () => chartTooltip.classList.remove("visible"));
+      }
+
+      async function loadInitialData() {
+        try {
+          const list = await invoke("get_services");
+          services = Array.isArray(list) ? list : [];
+        } catch (e) {
+          console.error("get_services failed:", e);
+          summary.textContent = "加载服务列表失败: " + String(e);
+          return;
+        }
+
+        try {
+          const settings = await invoke("get_settings");
+          intervalInput.value = String(settings.probe_interval_ms);
+          currentIntervalMs = settings.probe_interval_ms;
+        } catch (e) {
+          console.error("get_settings failed:", e);
+        }
+
+        renderStatusTable();
+        updateSummary();
+        resizeCanvas();
+        setupChartZoom();
+        setupChartHover();
+        await drawLatencyAll();
+        isProbing = true;
+        renderStatusTable();
+        try {
+          const results = await invoke("run_probe_all", {});
+          const arr = Array.isArray(results) ? results : [];
+          for (const r of arr) latestByService.set(r.service_id, r);
+        } catch (e) {
+          console.error("初始探测失败:", e);
+        } finally {
+          isProbing = false;
+          renderStatusTable();
+          updateSummary();
+          await drawLatencyAll();
+        }
+      }
+
+      function syncIntervalHint() {
+        const v = Number(intervalInput.value);
+        if (Number.isFinite(v) && v >= 1000) {
+          currentIntervalMs = v;
+          updateSummary();
+        }
+      }
+      intervalInput.addEventListener("input", syncIntervalHint);
+      intervalInput.addEventListener("change", syncIntervalHint);
+      intervalInput.addEventListener("blur", async () => {
+        const v = Number(intervalInput.value);
+        if (!Number.isFinite(v) || v < 5000) {
+          try {
+            const settings = await invoke("get_settings");
+            intervalInput.value = String(settings.probe_interval_ms);
+            updateIntervalHint(settings.probe_interval_ms);
+          } catch (_) {}
+          return;
+        }
+        try {
+          await invoke("update_probe_interval", { intervalMs: v });
+          updateIntervalHint(v);
+        } catch (e) {
+          console.error("update_probe_interval failed:", e);
+        }
+      });
+      intervalInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") intervalInput.blur();
+      });
+
+      (async function setupEvents() {
+        const tauri = window.__TAURI__;
+        if (!tauri || !tauri.event || !tauri.event.listen) return;
+        try {
+          await tauri.event.listen("probe_started", function () {
+            isProbing = true;
+            renderStatusTable();
+          });
+          await tauri.event.listen("tray_probe_now", async function () {
+            try {
+              const results = await invoke("run_probe_all", {});
+              const arr = Array.isArray(results) ? results : [];
+              for (const r of arr) latestByService.set(r.service_id, r);
+              renderStatusTable();
+              updateSummary();
+              await drawLatencyAll();
+            } catch (e) {
+              console.error("托盘触发探测失败:", e);
+            }
+          });
+          await tauri.event.listen("probe_batch", function (event) {
+            let batch = (event && event.payload) ? event.payload : (Array.isArray(event) ? event : []);
+            if (typeof batch === "string") {
+              try { batch = JSON.parse(batch); } catch (_) { batch = []; }
+            }
+            const arr = Array.isArray(batch) ? batch : [];
+            for (const r of arr) latestByService.set(r.service_id, r);
+            isProbing = false;
+            renderStatusTable();
+            updateSummary();
+            drawLatencyAll();
+          });
+        } catch (e) {
+          console.error("event listen failed:", e);
+        }
+      })();
+
+      setTimeout(loadInitialData, 0);
+      })();
+    </script>
+  </body>
+  </html>
+
