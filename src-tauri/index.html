@@ -249,8 +249,63 @@
       const latestByService = new Map();
       let isProbing = false;
       let chartData = null;
-      /** 图表缩放级别：1=24h, 2=12h, 4=6h, 0.5=48h */
-      let chartZoomLevel = 1;
+
+      // 图表的时间窗口（最近多少时间）
+      const MAX_WINDOW_MS = 48 * 60 * 60 * 1000; // 保持与原先最大 48h 一致
+      const MIN_WINDOW_MS = 30 * 1000; // 最小粒度：30s
+      const SECONDS_THRESHOLD_MS = 5 * 60 * 1000; // <= 5min 显示秒
+      let timeWindowMs = 24 * 60 * 60 * 1000; // 默认 24h
+
+      // 前端缓存：滚轮缩放时避免反复 invoke 后端
+      let allPointsCache = [];
+      const allPointsIndex = new Set(); // key: service_id|timestamp
+      let cacheLoaded = false;
+
+      function getPointKey(p) {
+        return p.service_id + "|" + p.timestamp;
+      }
+
+      function mergePoints(points) {
+        if (!Array.isArray(points) || points.length === 0) return;
+        for (const p of points) {
+          if (!p || typeof p.service_id !== "string") continue;
+          if (typeof p.timestamp !== "number") continue;
+          const key = getPointKey(p);
+          if (allPointsIndex.has(key)) continue;
+          allPointsIndex.add(key);
+          allPointsCache.push(p);
+        }
+
+        // 控制缓存大小：只保留最近 MAX_WINDOW_MS + 缓冲窗口
+        if (allPointsCache.length > 50000) {
+          const cutoff = Date.now() - (MAX_WINDOW_MS + 5 * 60 * 1000);
+          const next = [];
+          const nextIndex = new Set();
+          for (const p of allPointsCache) {
+            if (p.timestamp >= cutoff) {
+              nextIndex.add(getPointKey(p));
+              next.push(p);
+            }
+          }
+          allPointsCache = next;
+          allPointsIndex.clear();
+          for (const k of nextIndex) allPointsIndex.add(k);
+        }
+      }
+
+      function shouldShowSeconds() {
+        return timeWindowMs <= SECONDS_THRESHOLD_MS;
+      }
+
+      function formatWindowLabel(ms) {
+        if (ms <= 60 * 1000) {
+          return Math.max(1, Math.round(ms / 1000)) + "s";
+        }
+        if (ms <= 60 * 60 * 1000) {
+          return Math.max(1, Math.round(ms / 60_000)) + "m";
+        }
+        return Math.max(1, Math.round(ms / 3_600_000)) + "h";
+      }
 
       const CHART_COLORS = ["#22c55e", "#3b82f6", "#f59e0b", "#a855f7", "#ef4444"];
 
@@ -319,31 +374,33 @@
         }
       }
 
-      function formatTimeLabel(ts) {
+      function formatTimeLabel(ts, showSeconds) {
         const d = new Date(ts);
         const now = new Date();
         const isToday = d.toDateString() === now.toDateString();
+        const hh = d.getHours().toString().padStart(2, "0");
+        const mm = d.getMinutes().toString().padStart(2, "0");
+        const ss = d.getSeconds().toString().padStart(2, "0");
         if (isToday) {
-          return d.getHours().toString().padStart(2, "0") + ":" + d.getMinutes().toString().padStart(2, "0");
+          return showSeconds ? hh + ":" + mm + ":" + ss : hh + ":" + mm;
         }
-        return (d.getMonth() + 1) + "/" + d.getDate() + " " + d.getHours().toString().padStart(2, "0");
+        const md = d.getMonth() + 1 + "/" + d.getDate();
+        const base = md + " " + hh + ":" + mm;
+        return showSeconds ? base + ":" + ss : base;
       }
 
       /**
-       * 根据当前缩放级别重新绘制延迟图表。
-       * 缩放影响时间范围：1×=24h, 2×=12h, 4×=6h, 0.5×=48h
+       * 根据当前时间窗口重新绘制延迟图表。
+       * 注意：滚轮缩放不再 invoke 后端；数据来自前端缓存 `allPointsCache`。
        */
-      async function drawLatencyAll() {
+      function drawLatencyAll() {
         const now = Date.now();
-        const windowMs = (24 * 60 * 60 * 1000) / chartZoomLevel;
-        const since = now - windowMs;
-        let allPoints = [];
-        try {
-          const raw = await invoke("get_recent_probes_all", { sinceMs: since });
-          allPoints = Array.isArray(raw) ? raw : [];
-        } catch (e) {
-          console.error("get_recent_probes_all failed:", e);
-        }
+        const since = now - timeWindowMs;
+        const showSeconds = shouldShowSeconds();
+        const xTickCount = showSeconds ? 8 : 5;
+
+        // 截取当前窗口内的数据（缓存是“最近 MAX_WINDOW_MS”）
+        const allPoints = allPointsCache.filter((p) => p.timestamp >= since);
 
         const { w: logicalW, h: logicalH } = getLogicalSize();
         ctx.clearRect(0, 0, logicalW, logicalH);
@@ -357,22 +414,21 @@
           byService.get(p.service_id).push(p);
         }
 
-        let minX = Infinity, maxX = -Infinity, minY = 0, maxY = 100;
+        // 让横轴严格对应“当前时间窗口”
+        const minX = since;
+        const maxX = now;
+        const minY = 0;
+        let maxY = 100;
+
+        // 为断线检测/连线绘制提供稳定顺序
         for (const pts of byService.values()) {
-          const xs = pts.map((p) => p.timestamp);
-          const ys = pts
-            .map((p) => (p.reachable && p.latency_ms != null ? p.latency_ms : null))
-            .filter((v) => v != null);
-          if (xs.length) {
-            minX = Math.min(minX, ...xs);
-            maxX = Math.max(maxX, ...xs);
-          }
-          if (ys.length) {
-            maxY = Math.max(maxY, ...ys);
+          pts.sort((a, b) => a.timestamp - b.timestamp);
+          for (const p of pts) {
+            if (p.reachable && p.latency_ms != null) {
+              maxY = Math.max(maxY, p.latency_ms);
+            }
           }
         }
-        if (minX === Infinity) minX = 0;
-        if (maxX === -Infinity) maxX = minX + 1;
 
         const padLeft = 48;
         const padRight = 12;
@@ -413,7 +469,6 @@
 
         ctx.textAlign = "center";
         ctx.textBaseline = "top";
-        const xTickCount = 5;
         for (let i = 0; i <= xTickCount; i++) {
           const t = minX + (i / xTickCount) * (maxX - minX);
           const x = sx(t);
@@ -422,7 +477,7 @@
           ctx.lineTo(x, padTop + h);
           ctx.strokeStyle = "#1f2937";
           ctx.stroke();
-          ctx.fillText(formatTimeLabel(t), x, padTop + h + 4);
+          ctx.fillText(formatTimeLabel(t, showSeconds), x, padTop + h + 4);
         }
 
         ctx.beginPath();
@@ -442,6 +497,12 @@
           ctx.strokeStyle = color;
           ctx.lineWidth = 1.5;
           let segmentStarted = false;
+          let prevValidTimestamp = null;
+          // 如果相邻点间隔远超“正常探测周期”，说明中断来自会话关闭/重启，需断开折线
+          const gapThresholdMs = Math.max(
+            10_000,
+            currentIntervalMs * 2 + 5_000
+          );
           for (const p of pts) {
             const isValid = p.reachable && p.latency_ms != null;
             if (isValid) {
@@ -451,13 +512,23 @@
                 ctx.beginPath();
                 ctx.moveTo(x, y);
                 segmentStarted = true;
+                prevValidTimestamp = p.timestamp;
               } else {
-                ctx.lineTo(x, y);
+                const delta = p.timestamp - prevValidTimestamp;
+                if (delta > gapThresholdMs) {
+                  ctx.stroke();
+                  ctx.beginPath();
+                  ctx.moveTo(x, y);
+                } else {
+                  ctx.lineTo(x, y);
+                }
+                prevValidTimestamp = p.timestamp;
               }
             } else {
               if (segmentStarted) {
                 ctx.stroke();
                 segmentStarted = false;
+                prevValidTimestamp = null;
               }
             }
           }
@@ -488,6 +559,19 @@
         chartData = { byService, legendItems, padLeft, padRight, padTop, padBottom, w, h, minX, maxX, minY, maxY };
       }
 
+      async function preloadChartCache() {
+        if (cacheLoaded) return;
+        const now = Date.now();
+        const sinceMs = now - MAX_WINDOW_MS;
+        try {
+          const raw = await invoke("get_recent_probes_all", { sinceMs: sinceMs });
+          mergePoints(Array.isArray(raw) ? raw : []);
+        } catch (e) {
+          console.error("get_recent_probes_all failed:", e);
+        }
+        cacheLoaded = true;
+      }
+
       let currentIntervalMs = 30000;
 
       function updateSummary() {
@@ -512,29 +596,49 @@
         updateSummary();
       }
 
-      /**
-       * 更新图表缩放级别并重绘。
-       * @param {number} delta - 缩放步进，正数放大、负数缩小
-       */
-      function applyChartZoom(delta) {
-        const levels = [0.5, 1, 2, 4, 8, 16];
-        const idx = levels.indexOf(chartZoomLevel);
-        const newIdx = Math.max(0, Math.min(levels.length - 1, idx + delta));
-        chartZoomLevel = levels[newIdx];
-        zoomLabel.textContent = chartZoomLevel + "×";
-        drawLatencyAll();
+      let zoomRedrawRafPending = false;
+
+      function scheduleChartRedraw() {
+        if (zoomRedrawRafPending) return;
+        zoomRedrawRafPending = true;
+        requestAnimationFrame(() => {
+          zoomRedrawRafPending = false;
+          drawLatencyAll();
+        });
+      }
+
+      function setTimeWindowMs(nextMs) {
+        const clamped = Math.max(MIN_WINDOW_MS, Math.min(MAX_WINDOW_MS, nextMs));
+        if (clamped === timeWindowMs) return;
+        timeWindowMs = clamped;
+        zoomLabel.textContent = formatWindowLabel(timeWindowMs);
+        scheduleChartRedraw();
+      }
+
+      function zoomByFactor(factor) {
+        // factor > 1：放大时间范围（相当于“缩小”图表）；factor < 1：反之
+        setTimeWindowMs(timeWindowMs * factor);
       }
 
       function setupChartZoom() {
-        zoomInBtn.addEventListener("click", () => applyChartZoom(1));
-        zoomOutBtn.addEventListener("click", () => applyChartZoom(-1));
+        zoomLabel.textContent = formatWindowLabel(timeWindowMs);
+        zoomInBtn.addEventListener("click", () => zoomByFactor(1 / 1.6));
+        zoomOutBtn.addEventListener("click", () => zoomByFactor(1.6));
         const chartWrap = canvas.parentElement;
-        chartWrap.addEventListener("wheel", (e) => {
-          if (e.ctrlKey || e.metaKey) {
+        chartWrap.addEventListener(
+          "wheel",
+          (e) => {
+            if (!(e.ctrlKey || e.metaKey)) return;
             e.preventDefault();
-            applyChartZoom(e.deltaY > 0 ? -1 : 1);
-          }
-        }, { passive: false });
+
+            // 平滑连续缩放：滚轮越大，窗口变化越明显
+            // deltaY<0（向上滚）=> zoom in => timeWindowMs 变小
+            const sens = 0.0015;
+            const factor = Math.exp(e.deltaY * sens);
+            setTimeWindowMs(timeWindowMs * factor);
+          },
+          { passive: false }
+        );
       }
 
       function setupChartHover() {
@@ -569,7 +673,8 @@
             }
           });
           if (lines.length) {
-            chartTooltip.innerHTML = formatTimeLabel(invX) + "<br>" + lines.join("<br>");
+            chartTooltip.innerHTML =
+              formatTimeLabel(invX, shouldShowSeconds()) + "<br>" + lines.join("<br>");
             chartTooltip.classList.add("visible");
             const tx = Math.min(mx + 12, wrapRect.width - 120);
             const ty = Math.min(my + 12, wrapRect.height - 80);
@@ -605,20 +710,25 @@
         resizeCanvas();
         setupChartZoom();
         setupChartHover();
-        await drawLatencyAll();
+
+        // 启动时预加载最近 MAX_WINDOW_MS 数据；后续缩放仅过滤缓存
+        await preloadChartCache();
+        drawLatencyAll();
+
         isProbing = true;
         renderStatusTable();
         try {
           const results = await invoke("run_probe_all", {});
           const arr = Array.isArray(results) ? results : [];
           for (const r of arr) latestByService.set(r.service_id, r);
+          mergePoints(arr);
         } catch (e) {
           console.error("初始探测失败:", e);
         } finally {
           isProbing = false;
           renderStatusTable();
           updateSummary();
-          await drawLatencyAll();
+          drawLatencyAll();
         }
       }
 
@@ -665,9 +775,10 @@
               const results = await invoke("run_probe_all", {});
               const arr = Array.isArray(results) ? results : [];
               for (const r of arr) latestByService.set(r.service_id, r);
+              mergePoints(arr);
               renderStatusTable();
               updateSummary();
-              await drawLatencyAll();
+              drawLatencyAll();
             } catch (e) {
               console.error("托盘触发探测失败:", e);
             }
@@ -679,6 +790,7 @@
             }
             const arr = Array.isArray(batch) ? batch : [];
             for (const r of arr) latestByService.set(r.service_id, r);
+            mergePoints(arr);
             isProbing = false;
             renderStatusTable();
             updateSummary();
