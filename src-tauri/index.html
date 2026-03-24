@@ -215,7 +215,7 @@
               <button type="button" id="zoom-in" title="放大">+</button>
             </div>
           </div>
-          <div class="chart-wrap">
+          <div class="chart-wrap" title="拖动可左右滑动；Shift+滚轮滑动；Ctrl+滚轮缩放">
             <canvas id="latency-canvas"></canvas>
             <div id="chart-tooltip" class="chart-tooltip"></div>
           </div>
@@ -255,6 +255,18 @@
       const MIN_WINDOW_MS = 30 * 1000; // 最小粒度：30s
       const SECONDS_THRESHOLD_MS = 5 * 60 * 1000; // <= 5min 显示秒
       let timeWindowMs = 24 * 60 * 60 * 1000; // 默认 24h
+
+      /** 视图偏移（ms）：>0 表示向左滑动查看更早的数据 */
+      let viewOffsetMs = 0;
+      let isChartPanning = false;
+
+      /**
+       * 最大可滑动偏移（ms）。不能超过缓存范围，否则会越界。
+       * @returns {number}
+       */
+      function getMaxViewOffsetMs() {
+        return Math.max(0, MAX_WINDOW_MS - timeWindowMs);
+      }
 
       // 前端缓存：滚轮缩放时避免反复 invoke 后端
       let allPointsCache = [];
@@ -395,12 +407,13 @@
        */
       function drawLatencyAll() {
         const now = Date.now();
-        const since = now - timeWindowMs;
+        viewOffsetMs = Math.max(0, Math.min(getMaxViewOffsetMs(), viewOffsetMs));
+        const since = now - timeWindowMs - viewOffsetMs;
         const showSeconds = shouldShowSeconds();
         const xTickCount = showSeconds ? 8 : 5;
 
         // 截取当前窗口内的数据（缓存是“最近 MAX_WINDOW_MS”）
-        const allPoints = allPointsCache.filter((p) => p.timestamp >= since);
+        const allPoints = allPointsCache.filter((p) => p.timestamp >= since && p.timestamp <= since + timeWindowMs);
 
         const { w: logicalW, h: logicalH } = getLogicalSize();
         ctx.clearRect(0, 0, logicalW, logicalH);
@@ -414,9 +427,9 @@
           byService.get(p.service_id).push(p);
         }
 
-        // 让横轴严格对应“当前时间窗口”
+        // 让横轴严格对应“当前时间窗口”（含滑动偏移）
         const minX = since;
-        const maxX = now;
+        const maxX = since + timeWindowMs;
         const minY = 0;
         let maxY = 100;
 
@@ -611,6 +624,7 @@
         const clamped = Math.max(MIN_WINDOW_MS, Math.min(MAX_WINDOW_MS, nextMs));
         if (clamped === timeWindowMs) return;
         timeWindowMs = clamped;
+        viewOffsetMs = Math.min(viewOffsetMs, getMaxViewOffsetMs());
         zoomLabel.textContent = formatWindowLabel(timeWindowMs);
         scheduleChartRedraw();
       }
@@ -618,6 +632,59 @@
       function zoomByFactor(factor) {
         // factor > 1：放大时间范围（相当于“缩小”图表）；factor < 1：反之
         setTimeWindowMs(timeWindowMs * factor);
+      }
+
+      /**
+       * 左右滑动图表。deltaMs > 0：向左滑（查看更早数据）；deltaMs < 0：向右滑（查看更新数据）。
+       */
+      function panChart(deltaMs) {
+        const maxOff = getMaxViewOffsetMs();
+        if (maxOff <= 0) return;
+        const next = Math.max(0, Math.min(maxOff, viewOffsetMs + deltaMs));
+        if (next === viewOffsetMs) return;
+        viewOffsetMs = next;
+        scheduleChartRedraw();
+      }
+
+      function setupChartPan() {
+        const chartWrap = canvas.parentElement;
+        let isPanning = false;
+        let lastClientX = 0;
+
+        canvas.addEventListener("mousedown", (e) => {
+          if (e.button !== 0 || !chartData) return;
+          const { padLeft, padTop, w, h } = chartData;
+          const wrapRect = chartWrap.getBoundingClientRect();
+          const mx = e.clientX - wrapRect.left;
+          const my = e.clientY - wrapRect.top;
+          if (mx < padLeft || mx > padLeft + w || my < padTop || my > padTop + h) return;
+          isPanning = true;
+          isChartPanning = true;
+          lastClientX = e.clientX;
+          chartTooltip.classList.remove("visible");
+          canvas.style.cursor = "grabbing";
+        });
+
+        const onMouseUp = () => {
+          if (isPanning) {
+            isPanning = false;
+            isChartPanning = false;
+            canvas.style.cursor = "crosshair";
+          }
+        };
+
+        window.addEventListener("mouseup", onMouseUp);
+        window.addEventListener("mouseleave", onMouseUp);
+
+        canvas.addEventListener("mousemove", (e) => {
+          if (!isPanning) return;
+          const deltaX = e.clientX - lastClientX;
+          lastClientX = e.clientX;
+          if (!chartData || chartData.w <= 0) return;
+          // 向右拖拽 => deltaX>0 => 查看更早数据 => viewOffsetMs 增大
+          const deltaMs = (deltaX / chartData.w) * timeWindowMs;
+          panChart(deltaMs);
+        });
       }
 
       function setupChartZoom() {
@@ -628,11 +695,17 @@
         chartWrap.addEventListener(
           "wheel",
           (e) => {
+            if (e.shiftKey) {
+              // Shift+滚轮：左右滑动。向下滚 => 查看更早数据
+              e.preventDefault();
+              const deltaMs = (e.deltaY / 100) * (timeWindowMs * 0.15);
+              panChart(deltaMs);
+              return;
+            }
             if (!(e.ctrlKey || e.metaKey)) return;
             e.preventDefault();
 
-            // 平滑连续缩放：滚轮越大，窗口变化越明显
-            // deltaY<0（向上滚）=> zoom in => timeWindowMs 变小
+            // Ctrl+滚轮：平滑连续缩放
             const sens = 0.0015;
             const factor = Math.exp(e.deltaY * sens);
             setTimeWindowMs(timeWindowMs * factor);
@@ -644,7 +717,7 @@
       function setupChartHover() {
         const chartWrap = canvas.parentElement;
         canvas.addEventListener("mousemove", (e) => {
-          if (!chartData) return;
+          if (!chartData || isChartPanning) return;
           const wrapRect = chartWrap.getBoundingClientRect();
           const mx = e.clientX - wrapRect.left;
           const my = e.clientY - wrapRect.top;
@@ -709,6 +782,7 @@
         updateSummary();
         resizeCanvas();
         setupChartZoom();
+        setupChartPan();
         setupChartHover();
 
         // 启动时预加载最近 MAX_WINDOW_MS 数据；后续缩放仅过滤缓存
